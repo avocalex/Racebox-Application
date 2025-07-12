@@ -105,6 +105,21 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    // splits {
+    //     abi {
+    //         enable true
+    //         reset()
+    //         include "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+    //         universalApk false
+    //     }
+    // }
+
+    // packagingOptions {
+    //     jniLibs {
+    //         // Don't exclude arm64-v8a anymore
+    //         excludes += ['**/x86/**'] // Optional: leave this if you want
+    //     }
+    // }
 }
 
 dependencies {
