@@ -32,8 +32,8 @@ const parseRaceBoxLiveData = (buffer) => {
 
   const data = {};
   data.utc_time = payload.readUInt32LE(0);
-  data.latitude = payload.readInt32LE(24) / 1e7;
-  data.longitude = payload.readInt32LE(28) / 1e7;
+  data.latitude = payload.readInt32LE(28) / 1e7;
+  data.longitude = payload.readInt32LE(24) / 1e7;
   data.altitude_wgs = payload.readInt32LE(32) / 1000;
   data.altitude_msl = payload.readInt32LE(36) / 1000;
 
@@ -43,19 +43,35 @@ const parseRaceBoxLiveData = (buffer) => {
   data.heading = payload.readInt32LE(52) / 1e5;
 
   // 🔔 Print raw integer values for diagnostics
-  const rawGforceX = payload.readInt32LE(56);
-  const rawGforceY = payload.readInt32LE(60);
-  const rawGforceZ = payload.readInt32LE(64);
-  console.log(`🧐 Raw G-forces: X=${rawGforceX} Y=${rawGforceY} Z=${rawGforceZ}`);
+  const rawGforceX = payload.readInt16LE(68);
+  const rawGforceY = payload.readInt16LE(70);
+  const rawGforceZ = payload.readInt16LE(72);
+  // console.log(`🧐 Raw G-forces: X=${rawGforceX} Y=${rawGforceY} Z=${rawGforceZ}`);
 
-  data.g_force_x = rawGforceX / 1e6;
-  data.g_force_y = rawGforceY / 1e6;
-  data.g_force_z = rawGforceZ / 1e6;
+  data.g_force_x = rawGforceX / 1000;
+  data.g_force_y = rawGforceY / 1000;
+  data.g_force_z = rawGforceZ / 1000;
 
-  data.gyro_x = payload.readInt32LE(68) / 1e5;
-  data.gyro_y = payload.readInt32LE(72) / 1e5;
-  data.gyro_z = payload.readInt32LE(76) / 1e5;
+  const fixStatus = payload.readUInt8(20);
+  let fixDescription = '';
+  if (fixStatus === 0) fixDescription = 'No Fix';
+  else if (fixStatus === 2) fixDescription = '2D Fix';
+  else if (fixStatus === 3) fixDescription = '3D Fix';
+  else fixDescription = 'Unknown';
+  data.fixDescription = fixDescription;
 
+  // below is causing buffer overflow
+  // data.gyro_x = payload.readInt32LE(74) / 100;
+  // data.gyro_y = payload.readInt32LE(76) / 100;
+  // data.gyro_z = payload.readInt32LE(78) / 100;
+
+  /* eslint-disable no-bitwise */
+  const batteryRaw = buffer.readUInt8(payloadStart + 67);
+  const isCharging = (batteryRaw & 0x80) !== 0;
+  const batteryPercent = batteryRaw & 0x7F;
+  data.batteryPercent = batteryPercent;
+  data.isCharging = isCharging;
+  /* eslint-enable no-bitwise */
   return data;
 };
 
@@ -67,7 +83,7 @@ export default function App() {
   useEffect(() => {
     const subscription = manager.onStateChange((state) => {
       if (state === 'PoweredOn') {
-        setStatus('Bluetooth ready. Scanning...');
+        setStatus('📶 Bluetooth ready. Scanning...');
         scanAndConnect();
         subscription.remove();
       }
@@ -112,105 +128,100 @@ export default function App() {
         setStatus('RaceBox found, 📡 Connecting to GPS ...');
         manager.stopDeviceScan();
 
-        try {
-          const connectedDevice = await device.connect();
-          console.log('✅ Connected to RaceBox:', connectedDevice.id);
+    try {
+      const connectedDevice = await device.connect();
+      console.log('✅ Connected to RaceBox:', connectedDevice.id);
 
-          await connectedDevice.discoverAllServicesAndCharacteristics();
-          console.log('🔍 Services discovered');
+      await connectedDevice.discoverAllServicesAndCharacteristics();
+      console.log('🔍 Services discovered');
 
-          await connectedDevice.requestMTU(512);
-          setStatus('📊 Output Data Stream:');
+      await connectedDevice.requestMTU(512);
+      setStatus('📊 Output Data Stream:');
 
-          connectedDevice.monitorCharacteristicForService(
-            SERVICE_UUID,
-            TX_CHAR_UUID,
-            (error, characteristic) => {
-              if (error) {
-                console.error('Monitor error:', error);
-                setStatus('❌ Connection Error');
-                return;
+      connectedDevice.monitorCharacteristicForService(
+        SERVICE_UUID,
+        TX_CHAR_UUID,
+        (error, characteristic) => {
+          if (error) {
+            console.error('Monitor error:', error);
+            setStatus('❌ Connection Error');
+            return;
+          }
+
+          if (characteristic?.value) {
+            const incoming = Buffer.from(characteristic.value, 'base64');
+            packetBuffer = Buffer.concat([packetBuffer, incoming]);
+
+            while (packetBuffer.length >= 2) {
+              const syncPos = packetBuffer.indexOf(0xB5);
+              if (
+                syncPos === -1 ||
+                syncPos + 1 >= packetBuffer.length ||
+                packetBuffer[syncPos + 1] !== 0x62
+              ) {
+                packetBuffer = Buffer.alloc(0);
+                break;
               }
 
-              if (characteristic?.value) {
-                const incoming = Buffer.from(characteristic.value, 'base64');
-                packetBuffer = Buffer.concat([packetBuffer, incoming]);
+              if (syncPos > 0) {
+                packetBuffer = packetBuffer.slice(syncPos);
+              }
 
-                while (packetBuffer.length >= 2) {
-                  const syncPos = packetBuffer.indexOf(0xB5);
+              if (packetBuffer.length < 8) break;
 
-                  if (
-                    syncPos === -1 ||
-                    syncPos + 1 >= packetBuffer.length ||
-                    packetBuffer[syncPos + 1] !== 0x62
-                  ) {
-                    packetBuffer = Buffer.alloc(0);
-                    break;
-                  }
+              const msgClass = packetBuffer[2];
+              const msgId = packetBuffer[3];
 
-                  if (syncPos > 0) {
-                    packetBuffer = packetBuffer.slice(syncPos);
-                  }
+              if (msgClass !== 0xFF || msgId !== 0x01) {
+                packetBuffer = packetBuffer.slice(2);
+                continue;
+              }
 
-                  if (packetBuffer.length < 8) break;
+              if (packetBuffer.length < 6) break;
 
-                  const msgClass = packetBuffer[2];
-                  const msgId = packetBuffer[3];
+              const payloadLen = packetBuffer.readUInt16LE(4);
+              const totalLen = 8 + payloadLen + 2;
+              if (packetBuffer.length < totalLen) break;
 
-                  if (msgClass !== 0xFF || msgId !== 0x01) {
-                    packetBuffer = packetBuffer.slice(2);
-                    continue;
-                  }
+              const packet = packetBuffer.slice(0, totalLen);
+              const data = parseRaceBoxLiveData(packet);
 
-                  if (packetBuffer.length < 6) break;
+              if (data) {
+                console.log(`✅ Parsed:`, data);
 
-                  const payloadLen = packetBuffer.readUInt16LE(4);
-                  const totalLen = 8 + payloadLen + 2;
+                setLatestMessage(`Fix Status: ${data.fixDescription}
+                Battery: ${data.batteryPercent}% ${data.isCharging ? '(Charging)' : ''}
+                Speed: ${data.speed_mph.toFixed(1)} MPH
+                Lat: ${data.latitude.toFixed(1)} Lon: ${data.longitude.toFixed(1)}
+                Alt (WGS): ${data.altitude_wgs.toFixed(1)} m
+                Heading: ${data.heading.toFixed(1)}°
+                G-Force X: ${data.g_force_x.toFixed(2)} Y: ${data.g_force_y.toFixed(2)} Z: ${data.g_force_z.toFixed(2)}`);
 
-                  if (packetBuffer.length < totalLen) break;
-
-                  const packet = packetBuffer.slice(0, totalLen);
-                  const data = parseRaceBoxLiveData(packet);
-
-                  if (data) {
-                    console.log(`✅ Parsed:`, data);
-
-                    if (data.speed_mph > 0) {
-                      setLatestMessage(
-                        `Speed: ${data.speed_mph.toFixed(1)} MPH\n` +
-                        `Lat: ${data.latitude.toFixed(5)}\nLon: ${data.longitude.toFixed(5)}\n` +
-                        `Alt (WGS): ${data.altitude_wgs} m\n` +
-                        `Heading: ${data.heading.toFixed(1)}°\n` +
-                        `G-Force X: ${data.g_force_x.toFixed(2)} Y: ${data.g_force_y.toFixed(2)} Z: ${data.g_force_z.toFixed(2)}\n` +
-                        `Gyro X: ${data.gyro_x.toFixed(2)} Y: ${data.gyro_y.toFixed(2)} Z: ${data.gyro_z.toFixed(2)}`
-                      );
-                    } else {
-                      setLatestMessage(`Waiting for valid speed...`);
-                    }
-
-                    packetBuffer = packetBuffer.slice(totalLen);
-                  } else {
-                    packetBuffer = packetBuffer.slice(2);
-                  }
-                }
+                packetBuffer = packetBuffer.slice(totalLen);
+              } else {
+                packetBuffer = packetBuffer.slice(2);
               }
             }
-          );
-
-          const command = 'START\n';
-          const base64Command = Buffer.from(command, 'utf-8').toString('base64');
-
-          await connectedDevice.writeCharacteristicWithResponseForService(
-            SERVICE_UUID,
-            RX_CHAR_UUID,
-            base64Command
-          );
-          console.log('📤 Sent START command');
-
-        } catch (err) {
-          console.error('❌ Connection error:', err);
-          setStatus('Connection failed');
+          }
         }
+      );
+
+  const command = 'START\n';
+  const base64Command = Buffer.from(command, 'utf-8').toString('base64');
+
+  await connectedDevice.writeCharacteristicWithResponseForService(
+    SERVICE_UUID,
+    RX_CHAR_UUID,
+    base64Command
+  );
+  console.log('📤 Sent START command');
+
+  } catch (err) {
+    console.error('❌ Connection error:', err.message);
+    setStatus('⚠️ Disconnected. Reconnecting in 3 seconds...');
+    setTimeout(() => scanAndConnect(), 3000);
+  }
+
       }
     });
   };
@@ -230,198 +241,10 @@ const styles = StyleSheet.create({
   container: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
   header: { fontSize: 24, fontWeight: 'bold', marginBottom: 10 },
   status: { fontSize: 16, marginBottom: 20 },
-  messageBox: { borderWidth: 1, padding: 15, borderRadius: 8, minWidth: 250 },
-  message: { fontSize: 14, textAlign: 'center' },
+  messageBox: { borderWidth: 1, padding: 15, borderRadius: 8, 
+  minWidth: 300,   // adjust width for better centering
+  alignItems: 'center',  // ensure contents are centered inside box
+  },  
+  message: { fontSize: 14, textAlign: 'center', textAlignVertical: 'center' },
 });
 
-
-
-// const styles = StyleSheet.create({
-//   container: {
-//     flex: 1,
-//     backgroundColor: '#111',
-//     paddingTop: 50,
-//     paddingHorizontal: 20,
-//   },
-//   header: {
-//     color: '#00ffcc',
-//     fontSize: 22,
-//     marginBottom: 10,
-//     textAlign: 'center',
-//   },
-//   status: {
-//     color: '#aaa',
-//     fontSize: 14,
-//     marginBottom: 12,
-//     textAlign: 'center',
-//   },
-//   messageBox: {
-//     backgroundColor: '#222',
-//     padding: 16,
-//     borderRadius: 10,
-//     minHeight: 100,
-//     justifyContent: 'center',
-//   },
-//   message: {
-//     color: '#fff',
-//     fontSize: 16,
-//   },
-// });
-
-
-//////////////////////////////////////////////////////////////
-
-
-// import React, { useEffect, useState } from 'react';
-// import {
-//   View,
-//   Text,
-//   StyleSheet,
-//   PermissionsAndroid,
-//   Platform,
-//   ScrollView,
-// } from 'react-native';
-// import { BleManager } from 'react-native-ble-plx';
-
-// const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-// const RX_CHARACTERISTIC_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
-// const TX_CHARACTERISTIC_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
-
-// const manager = new BleManager();
-
-// const App = () => {
-//   const [status, setStatus] = useState('Scanning...');
-//   const [data, setData] = useState('');
-
-//   useEffect(() => {
-//     const startBLE = async () => {
-//       if (Platform.OS === 'android') {
-//         await PermissionsAndroid.requestMultiple([
-//           PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-//           PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-//           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-//         ]);
-//       }
-
-//       manager.startDeviceScan(null, null, async (error, device) => {
-//         if (error) {
-//           setStatus(`Scan error: ${error.message}`);
-//           return;
-//         }
-
-//         if (device?.name?.includes('RaceBox Mini S')) {
-//           setStatus(`Found: ${device.name}`);
-//           manager.stopDeviceScan();
-
-//           try {
-//             const connectedDevice = await device.connect();
-//             setStatus('Connected to RaceBox');
-
-//             await connectedDevice.discoverAllServicesAndCharacteristics();
-
-//             // Enable notifications from TX
-//             connectedDevice.monitorCharacteristicForService(
-//               UART_SERVICE_UUID,
-//               TX_CHARACTERISTIC_UUID,
-//               (error, characteristic) => {
-//                 if (error) {
-//                   setStatus(`Notification error: ${error.message}`);
-//                   return;
-//                 }
-
-//                 if (characteristic?.value) {
-//                   const decoded = atob(characteristic.value);
-//                   setData(prev => `${prev}\n${decoded}`);
-//                 }
-//               }
-//             );
-
-//             // Example command: Get firmware version
-//             const command = 'VER\r';
-//             const base64Command = btoa(command);
-//             await connectedDevice.writeCharacteristicWithResponseForService(
-//               UART_SERVICE_UUID,
-//               RX_CHARACTERISTIC_UUID,
-//               base64Command
-//             );
-//           } catch (err) {
-//             setStatus(`Connection failed: ${err.message}`);
-//           }
-//         }
-//       });
-//     };
-
-//     startBLE();
-
-//     return () => {
-//       manager.destroy();
-//     };
-//   }, []);
-
-//   return (
-//     <View style={styles.container}>
-//       <Text style={styles.status}>{status}</Text>
-//       <Text style={styles.label}>RaceBox Data:</Text>
-//       <ScrollView style={styles.scroll}>
-//         <Text style={styles.data}>{data || 'Waiting for data...'}</Text>
-//       </ScrollView>
-//     </View>
-//   );
-// };
-
-// const styles = StyleSheet.create({
-//   container: { flex: 1, padding: 16, backgroundColor: '#fff' },
-//   status: { fontSize: 18, fontWeight: 'bold', marginBottom: 10 },
-//   label: { fontSize: 16, marginBottom: 6 },
-//   scroll: { flex: 1, backgroundColor: '#eee', padding: 10 },
-//   data: { fontFamily: 'monospace' },
-// });
-
-// export default App;
-
-
-
-
-
-// import React, { useEffect } from 'react';
-// import { View, Text, Button, PermissionsAndroid, Platform } from 'react-native';
-// import { BleManager } from 'react-native-ble-plx';
-// import { requestBluetoothPermissions } from './ble/permissions';
-
-// const manager = new BleManager();
-
-// export default function App() {
-//   useEffect(() => {
-//     requestBluetoothPermissions();
-//   }, []);
-
-//   const scanForRaceBox = async () => {
-//     const permissionGranted = await requestBluetoothPermissions();
-
-//     if (!permissionGranted) {
-//       console.log('❌ Bluetooth permissions not granted');
-//       return;
-//     }
-
-//     manager.startDeviceScan(null, null, (error, device) => {
-//       if (error) {
-//         console.log('Scan error:', error);
-//         return;
-//       }
-
-//       console.log('📡 Device:', device.name, device.id);
-
-//       if (device.name && device.name.includes('RaceBox')) {
-//         console.log('🎯 Found RaceBox:', device.name, device.id);
-//         manager.stopDeviceScan();
-//       }
-//     });
-//   };
-
-//   return (
-//     <View style={{ padding: 20 }}>
-//       <Text style={{ fontSize: 18, marginBottom: 10 }}>RaceBox Scanner</Text>
-//       <Button title="Scan for RaceBox" onPress={scanForRaceBox} />
-//     </View>
-//   );
-// }
